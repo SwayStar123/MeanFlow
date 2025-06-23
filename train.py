@@ -23,7 +23,7 @@ from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 
-from config import AE_SCALING_FACTOR, AE_SHIFT_FACTOR
+from config import AE_SCALING_FACTOR, AE_SHIFT_FACTOR, MODELS_DIR_BASE
 from sit import SiT_models
 from loss import SILoss
 from meanflow_sampler import meanflow_sampler
@@ -314,7 +314,7 @@ def main(args):
     # Initialize VAE on all processes (needed for FID calculation)
     vae = VAE_F16D32()
 
-    vae_state_dict = torch.load("path/to/vae/weights.pt", map_location="cpu")
+    vae_state_dict = torch.load(f"{MODELS_DIR_BASE}/e2e-invae-400k.pt.pt", map_location="cpu")
     vae.load_state_dict(vae_state_dict)
     vae.eval()
     
