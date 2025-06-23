@@ -14,17 +14,22 @@ import torch.utils.checkpoint
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
+import torchvision
+import wandb
+from torchmetrics.image.fid import FrechetInceptionDistance
+from torchvision.transforms import ConvertImageDtype
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
 
+from config import AE_SCALING_FACTOR, AE_SHIFT_FACTOR
 from sit import SiT_models
 from loss import SILoss
+from meanflow_sampler import meanflow_sampler
 
-from dataset import LMDBLatentsDataset
-from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
-import math
+from shapebatching_dataset import get_dataset
+from autoencoder import VAE_F16D32
 
 logger = get_logger(__name__)
 
@@ -62,6 +67,112 @@ def requires_grad(model, flag=True):
     """
     for p in model.parameters():
         p.requires_grad = flag
+
+
+@torch.no_grad()
+def sample_images(model, vae, noise, labels, cfg_scale=1.0, sample_steps=1):
+    """
+    Sample images using the meanflow_sampler and VAE decoder.
+    """
+    # Use meanflow_sampler for generation
+    sampled_latents = meanflow_sampler(
+        model, 
+        noise, 
+        y=labels, 
+        cfg_scale=cfg_scale,
+        num_steps=sample_steps
+    )
+    
+    # Decode latents to images
+    sampled_images = vae.decode(sampled_latents).sample.clamp(-1, 1)
+    
+    # Create grid
+    grid = torchvision.utils.make_grid(sampled_images, nrow=4, normalize=True, scale_each=True, value_range=(-1, 1))
+    
+    return grid
+
+
+@torch.no_grad()
+def calculate_fid(model, vae, val_data, accelerator, args, num_samples=50000):
+    """
+    Calculate FID score using generated and real images across all GPUs.
+    """
+    model.eval()
+    
+    # Initialize FID metric on each GPU
+    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(accelerator.device)
+    rescaler_to_uint8 = ConvertImageDtype(torch.uint8)
+    rescaler_to_0_1 = lambda x: (x + 1.0) / 2.0  # Convert [-1, 1] to [0, 1]
+    
+    # Calculate samples per process
+    samples_per_process = num_samples // accelerator.num_processes
+    local_batch_size = args.batch_size // accelerator.num_processes
+    
+    # Move VAE to device
+    vae = vae.to(accelerator.device)
+    
+    samples_processed = 0
+    
+    try:
+        for batch in val_data:
+            if samples_processed >= samples_per_process:
+                break
+                
+            real_latents = batch['ae_latent'].to(accelerator.device, non_blocking=True)
+            labels = batch['label'].to(accelerator.device, non_blocking=True)
+            
+            batch_size = real_latents.shape[0]
+            
+            # Decode real latents to get real images
+            real_latents_scaled = real_latents * AE_SCALING_FACTOR + AE_SHIFT_FACTOR
+            real_images = vae.decode(real_latents_scaled).sample.clamp(-1, 1)
+            
+            # Generate fake images using meanflow_sampler
+            noise = torch.randn_like(real_latents_scaled)
+            fake_latents = meanflow_sampler(
+                model, 
+                noise, 
+                y=labels, 
+                cfg_scale=args.sample_cfg_scale,
+                num_steps=args.sample_steps
+            )
+            
+            fake_images = vae.decode(fake_latents).sample.clamp(-1, 1)
+            
+            # Convert to uint8 for FID calculation
+            real_images_uint8 = rescaler_to_uint8(rescaler_to_0_1(real_images))
+            fake_images_uint8 = rescaler_to_uint8(rescaler_to_0_1(fake_images))
+            
+            # Update FID
+            fid.update(real_images_uint8, real=True)
+            fid.update(fake_images_uint8, real=False)
+            
+            samples_processed += batch_size
+            
+    except Exception as e:
+        if accelerator.is_main_process:
+            logger.warning(f"Error during FID calculation: {e}")
+        return float('inf')
+    
+    # Synchronize across all processes
+    accelerator.wait_for_everyone()
+    
+    # Compute FID score
+    try:
+        fid_score = fid.compute()
+        fid_value = fid_score.item() if torch.is_tensor(fid_score) else fid_score
+    except Exception as e:
+        if accelerator.is_main_process:
+            logger.warning(f"Error computing FID: {e}")
+        fid_value = float('inf')
+    
+    # Cleanup
+    del fid
+    vae = vae.to("cpu")
+    torch.cuda.empty_cache()
+    
+    model.train()
+    return fid_value
 
 #################################################################################
 #                                  Training Loop                                #
@@ -145,6 +256,13 @@ def main(args):
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+        
+        # Initialize wandb
+        wandb.init(
+            project="MeanFlow", 
+            config=vars(args),
+            name=args.exp_name
+        )
     
     # Setup optimizer
     if args.allow_tf32:
@@ -160,20 +278,11 @@ def main(args):
     )    
     
     # Setup data:
-    train_dataset = LMDBLatentsDataset(args.data_dir, flip_prob=0.5)
-    local_batch_size = int(args.batch_size // accelerator.num_processes)
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=local_batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
+    train_data = get_dataset(args.batch_size, args.seed, device, args.num_workers, split="train")
+    # Note: ShapeBatchingDataset is already an IterableDataset with internal DataLoader
     if accelerator.is_main_process:
-        logger.info(f"Dataset contains {len(train_dataset):,} images ({args.data_dir})")
-    steps_per_epoch = len(train_dataloader) // accelerator.gradient_accumulation_steps
-    args.max_train_steps = args.epochs * steps_per_epoch // accelerator.num_processes
+        logger.info(f"Training on dataset: {args.data_dir}")
+    
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
@@ -192,9 +301,33 @@ def main(args):
         optimizer.load_state_dict(ckpt['opt'])
         global_step = ckpt['steps']
 
-    model, optimizer, train_dataloader = accelerator.prepare(
-        model, optimizer, train_dataloader
+    # Create validation dataset for FID calculation if needed (on all processes)
+    val_data = None
+    if args.enable_fid:
+        val_data = get_dataset(args.batch_size, args.seed + accelerator.process_index, device, args.num_workers, split="validation")
+        # ShapeBatchingDataset doesn't need to be prepared since it's already an IterableDataset
+
+    model, optimizer, train_data, val_data = accelerator.prepare(
+        model, optimizer, train_data, val_data
     )
+    
+    # Initialize VAE on all processes (needed for FID calculation)
+    vae = VAE_F16D32()
+
+    vae_state_dict = torch.load("path/to/vae/weights.pt", map_location="cpu")
+    vae.load_state_dict(vae_state_dict)
+    vae.eval()
+    
+    # Setup for sampling - create fixed noise and example labels (main process only)
+    if accelerator.is_main_process:
+        # Create fixed noise for consistent sampling
+        fixed_noise = torch.randn(16, 4, latent_size, latent_size, device=device)
+        
+        # Define example captions/labels for sampling
+        ex_labels = torch.tensor([
+            933, 954, 849, 980, 971, 938, 953, 672, 
+            235, 817, 283, 603, 834, 497, 851, 4
+        ], device=device)  # Example ImageNet class labels
         
     progress_bar = tqdm(
         range(0, args.max_train_steps),
@@ -203,23 +336,15 @@ def main(args):
         # Only show the progress bar once on each machine.
         disable=not accelerator.is_local_main_process,
     )
-    # here is a trick from IMM. https://github.com/lumalabs/imm/blob/main/training/encoders.py
-    latents_scale = torch.tensor(
-        [0.18125, 0.18125, 0.18125, 0.18125]
-        ).view(1, 4, 1, 1).to(device)
-    latents_bias = torch.tensor(
-        [0., 0., 0., 0.]
-        ).view(1, 4, 1, 1).to(device)
-    for epoch in range(args.epochs):
+
+    while True:
         model.train()
-        for moments, labels in train_dataloader:
-            moments = moments.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+        for batch in train_data:
+            x = batch['ae_latent'].to(device, non_blocking=True)
+            labels = batch['label'].to(device, non_blocking=True)
 
             with torch.no_grad():
-                posterior = DiagonalGaussianDistribution(moments)
-                x = posterior.sample()
-                x = x * latents_scale + latents_bias
+                x = x * AE_SCALING_FACTOR + AE_SHIFT_FACTOR
             
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
@@ -242,6 +367,19 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1                
             if global_step % args.checkpointing_steps == 0 and global_step > 0 or global_step >= args.max_train_steps:
+                # Calculate FID before saving checkpoint (if enabled)
+                if args.enable_fid:
+                    accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        logger.info(f"Calculating FID at step {global_step}")
+                    
+                    fid_score = calculate_fid(ema, vae, val_data, accelerator, args, num_samples=args.fid_samples)
+                    
+                    if accelerator.is_main_process:
+                        logger.info(f"FID Score: {fid_score:.4f}")
+                        # Log FID to wandb
+                        wandb.log({"fid_score": fid_score}, step=global_step)
+                
                 if accelerator.is_main_process:
                     checkpoint = {
                         "model": model.module.state_dict(),
@@ -260,16 +398,38 @@ def main(args):
             }
             progress_bar.set_postfix(**logs)
             
+            # Log loss to wandb every step
+            if accelerator.is_main_process:
+                wandb.log({"loss": logs["loss"], "grad_norm": logs["grad_norm"]}, step=global_step)
+            
             # Log to file periodically
             if accelerator.is_main_process and global_step % 100 == 0:
                 logger.info(f"Step {global_step}: loss = {logs['loss']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
+            
+            # Sample images every 200 steps
+            if accelerator.is_main_process and global_step % 200 == 0 and global_step > 0:
+                logger.info(f"Sampling images at step {global_step}")
+                with torch.no_grad():
+                    model.eval()
+                    vae = vae.to(device)
+                    
+                    # Sample images using the EMA model
+                    grid = sample_images(ema, vae, fixed_noise, ex_labels, args.num_classes, device, 
+                                       cfg_scale=args.sample_cfg_scale, sample_steps=args.sample_steps)
+                    
+                    # Save sampled images
+                    sample_path = f"{save_dir}/sampled_images_step_{global_step:07d}.png"
+                    torchvision.utils.save_image(grid, sample_path)
+                    
+                    # Log to wandb
+                    wandb.log({"sampled_images": wandb.Image(sample_path)}, step=global_step)
+                    
+                    # Move VAE back to CPU to save memory
+                    vae = vae.to("cpu")
+                    model.train()
 
             if global_step >= args.max_train_steps:
                 break
-        
-        # Log epoch completion
-        if accelerator.is_main_process:
-            logger.info(f"Completed epoch {epoch+1}/{args.epochs}")
             
         if global_step >= args.max_train_steps:
             break
@@ -296,6 +456,7 @@ def parse_args(input_args=None):
     parser.add_argument("--data-dir", type=str, default="/data/train_sdvae_latents_lmdb")
     parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--max_train_steps", type=int, default=400000) # 400k steps = 80 epochs
 
     # precision
     parser.add_argument("--allow-tf32", action="store_true")
@@ -337,10 +498,21 @@ def parse_args(input_args=None):
     parser.add_argument("--cfg-max-t", type=float, default=1.0, help="Maxium time for cfg trigger")
     parser.add_argument("--bootstrap-ratio", type=float, default=0.75, help="Ratio of EMA gt")
     
+    # Evaluation parameters
+    parser.add_argument("--enable-fid", action="store_true", default=True, help="Enable FID calculation during checkpointing")
+    parser.add_argument("--disable-fid", action="store_true", help="Disable FID calculation during checkpointing")
+    parser.add_argument("--fid-samples", type=int, default=50000, help="Number of samples for FID calculation")
+    parser.add_argument("--sample-cfg-scale", type=float, default=1.0, help="CFG scale for sampling")
+    parser.add_argument("--sample-steps", type=int, default=1, help="Number of sampling steps")
+    
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
+    
+    # Handle FID enable/disable logic
+    if args.disable_fid:
+        args.enable_fid = False
         
     return args
 
