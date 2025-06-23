@@ -69,6 +69,20 @@ def requires_grad(model, flag=True):
         p.requires_grad = flag
 
 
+def free_gpu_memory(*tensors):
+    """Delete provided tensors (if any) and empty the CUDA cache to proactively
+    release VRAM. Use this **sparingly** inside tight loops when you are sure
+    the tensors are no longer needed."""
+    for t in tensors:
+        try:
+            del t
+        except Exception:
+            # If the tensor is already out of scope or None, ignore.
+            pass
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 @torch.no_grad()
 def sample_images(model, vae, noise, labels, cfg_scale=1.0, sample_steps=1):
     """
@@ -84,7 +98,7 @@ def sample_images(model, vae, noise, labels, cfg_scale=1.0, sample_steps=1):
     )
     
     # Decode latents to images
-    sampled_images = vae.decode(sampled_latents).sample.clamp(-1, 1)
+    sampled_images = vae.decode((sampled_latents - AE_SHIFT_FACTOR) / AE_SCALING_FACTOR).sample.clamp(-1, 1)
     
     # Create grid
     grid = torchvision.utils.make_grid(sampled_images, nrow=4, normalize=True, scale_each=True, value_range=(-1, 1))
@@ -124,11 +138,10 @@ def calculate_fid(model, vae, val_data, accelerator, args, num_samples=50000):
             batch_size = real_latents.shape[0]
             
             # Decode real latents to get real images
-            real_latents_scaled = real_latents * AE_SCALING_FACTOR + AE_SHIFT_FACTOR
-            real_images = vae.decode(real_latents_scaled).sample.clamp(-1, 1)
+            real_images = vae.decode(real_latents).sample.clamp(-1, 1)
             
             # Generate fake images using meanflow_sampler
-            noise = torch.randn_like(real_latents_scaled)
+            noise = torch.randn_like(real_latents)
             fake_latents = meanflow_sampler(
                 model, 
                 noise, 
@@ -137,7 +150,7 @@ def calculate_fid(model, vae, val_data, accelerator, args, num_samples=50000):
                 num_steps=args.sample_steps
             )
             
-            fake_images = vae.decode(fake_latents).sample.clamp(-1, 1)
+            fake_images = vae.decode((fake_latents - AE_SHIFT_FACTOR) / AE_SCALING_FACTOR).sample.clamp(-1, 1)
             
             # Convert to uint8 for FID calculation
             real_images_uint8 = rescaler_to_uint8(rescaler_to_0_1(real_images))
@@ -147,6 +160,16 @@ def calculate_fid(model, vae, val_data, accelerator, args, num_samples=50000):
             fid.update(real_images_uint8, real=True)
             fid.update(fake_images_uint8, real=False)
             
+            free_gpu_memory(
+                real_latents,
+                labels,
+                real_images,
+                fake_latents,
+                fake_images,
+                real_images_uint8,
+                fake_images_uint8,
+            )
+
             samples_processed += batch_size
             
     except Exception as e:
@@ -252,7 +275,6 @@ def main(args):
         cfg_kappa=args.cfg_kappa,
         cfg_min_t=args.cfg_min_t,
         cfg_max_t=args.cfg_max_t,
-        bootstrap_ratio=args.bootstrap_ratio
     )
     if accelerator.is_main_process:
         logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -314,14 +336,17 @@ def main(args):
     # Initialize VAE on all processes (needed for FID calculation)
     vae = VAE_F16D32()
 
-    vae_state_dict = torch.load(f"{MODELS_DIR_BASE}/e2e-invae-400k.pt.pt", map_location="cpu")
+    vae_state_dict = torch.load(f"{MODELS_DIR_BASE}/e2e-invae-400k.pt", map_location="cpu")
     vae.load_state_dict(vae_state_dict)
     vae.eval()
+    vae.to("cpu")
+
+    del vae_state_dict
     
     # Setup for sampling - create fixed noise and example labels (main process only)
     if accelerator.is_main_process:
         # Create fixed noise for consistent sampling
-        fixed_noise = torch.randn(16, 4, latent_size, latent_size, device=device)
+        fixed_noise = torch.randn(16, 32, latent_size, latent_size, device=device)
         
         # Define example captions/labels for sampling
         ex_labels = torch.tensor([
@@ -348,7 +373,7 @@ def main(args):
             
             with accelerator.accumulate(model):
                 model_kwargs = dict(y=labels)
-                loss = loss_fn(model, ema, x, model_kwargs)
+                loss = loss_fn(model, x, model_kwargs)
                 loss_mean = loss.mean()
                 loss = loss_mean
                     
@@ -414,8 +439,7 @@ def main(args):
                     vae = vae.to(device)
                     
                     # Sample images using the EMA model
-                    grid = sample_images(ema, vae, fixed_noise, ex_labels, args.num_classes, device, 
-                                       cfg_scale=args.sample_cfg_scale, sample_steps=args.sample_steps)
+                    grid = sample_images(model, vae, fixed_noise, ex_labels, cfg_scale=args.sample_cfg_scale, sample_steps=args.sample_steps)
                     
                     # Save sampled images
                     sample_path = f"{save_dir}/sampled_images_step_{global_step:07d}.png"
@@ -426,7 +450,12 @@ def main(args):
                     
                     # Move VAE back to CPU to save memory
                     vae = vae.to("cpu")
+                    
+                    free_gpu_memory(grid)
+                    
                     model.train()
+
+            free_gpu_memory(x, labels, loss, loss_mean)
 
             if global_step >= args.max_train_steps:
                 break
@@ -456,7 +485,7 @@ def parse_args(input_args=None):
     parser.add_argument("--data-dir", type=str, default="/data/train_sdvae_latents_lmdb")
     parser.add_argument("--resolution", type=int, choices=[256, 512], default=256)
     parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--max_train_steps", type=int, default=400000) # 400k steps = 80 epochs
+    parser.add_argument("--max_train_steps", type=int, default=1200000) # 1.2M steps = 240 epochs
 
     # precision
     parser.add_argument("--allow-tf32", action="store_true")

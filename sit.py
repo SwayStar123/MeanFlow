@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from timm.models.vision_transformer import Attention, Mlp
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -130,6 +130,15 @@ class FinalLayer(nn.Module):
 
         return x
 
+class PatchEmbed(nn.Module):
+    def __init__(self, in_channels, embed_dim, patch_size):
+        super().__init__()
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_size = patch_size
+
+    def forward(self, x):
+        x = self.proj(x)  # (B, C, H, W) -> (B, E, H', W')
+        return x.flatten(2).transpose(1, 2)  # (B, E, H', W') -> (B, H'*W', E)
 
 class SiT(nn.Module):
     """
@@ -140,7 +149,7 @@ class SiT(nn.Module):
         path_type='edm',
         input_size=32,
         patch_size=2,
-        in_channels=4,
+        in_channels=32,
         hidden_size=1152,
         decoder_hidden_size=768,
         depth=28,
@@ -162,16 +171,14 @@ class SiT(nn.Module):
         self.use_cfg = use_cfg
         self.num_classes = num_classes
         self.z_dims = z_dims
+        self.embed_dim = hidden_size
 
         self.x_embedder = PatchEmbed(
-            input_size, patch_size, in_channels, hidden_size, bias=True
-            )
+            in_channels, hidden_size, patch_size
+        )
         self.t_embedder = TimestepEmbedder(hidden_size) # timestep embedding type
         self.r_embedder = TimestepEmbedder(hidden_size) # timestep embedding type
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, **block_kwargs) for _ in range(depth)
@@ -187,12 +194,6 @@ class SiT(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
-
-        # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5)
-            )
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
@@ -218,20 +219,43 @@ class SiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x, patch_size=None):
+    def unpatchify(self, x, patch_size, height, width):
         """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, C, H, W)
-        """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0] if patch_size is None else patch_size
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
+        Reconstructs images from patches.
 
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, w * p))
-        return imgs
+        Args:
+            x (torch.Tensor): Tensor of shape (bs, num_patches, patch_size * patch_size * in_channels)
+            patch_size (int): Size of each patch.
+            height (int): Original image height.
+            width (int): Original image width.
+
+        Returns:
+            torch.Tensor: Reconstructed image of shape (bs, in_channels, height, width)
+        """
+        bs, num_patches, patch_dim = x.shape
+        H = W = patch_size
+        in_channels = patch_dim // (H * W)
+
+        # Calculate the number of patches along each dimension
+        num_patches_h = height // H
+        num_patches_w = width // W
+
+        # Ensure num_patches equals num_patches_h * num_patches_w
+        assert num_patches == num_patches_h * num_patches_w, "Mismatch in number of patches."
+
+        # Reshape x to (bs, num_patches_h, num_patches_w, H, W, in_channels)
+        x = x.view(bs, num_patches_h, num_patches_w, H, W, in_channels)
+
+        # Permute x to (bs, num_patches_h, H, num_patches_w, W, in_channels)
+        x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
+
+        # Reshape x to (bs, height, width, in_channels)
+        reconstructed = x.view(bs, height, width, in_channels)
+
+        # Permute back to (bs, in_channels, height, width)
+        reconstructed = reconstructed.permute(0, 3, 1, 2).contiguous()
+
+        return reconstructed
     
     def forward(self, x, r, t, y=None, return_logvar=False):
         """
@@ -241,23 +265,26 @@ class SiT(nn.Module):
         t: (N,) tensor of end timesteps
         y: (N,) tensor of class labels
         """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        N, T, D = x.shape
+        batch_size, _, height, width = x.shape
+
+        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, height // self.patch_size, width // self.patch_size)
+        pos_embed = pos_embed.to(x.device).unsqueeze(0).expand(batch_size, -1, -1)
+
+        x = self.x_embedder(x) + pos_embed # (N, T, D), where T = H * W / patch_size ** 2
+
         # Timestep and class embedding - modified for MeanFlow with r and t
         t_embed = self.t_embedder(t)   # (N, D)
         r_embed = self.r_embedder(t-r)   # (N, D)
         
-        
         if y is None:
-            y = torch.zeros(N, dtype=torch.long, device=x.device)
-            
+            y = torch.zeros(batch_size, dtype=torch.long, device=x.device)
         y_embed = self.y_embedder(y, self.training)  # (N, D)
         c = t_embed + r_embed + y_embed  # (N, D)
 
         for i, block in enumerate(self.blocks):
             x = block(x, c)  # (N, T, D)
         x = self.final_layer(x, c)  # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)  # (N, out_channels, H, W)
+        x = self.unpatchify(x, self.patch_size, height, width)  # (N, out_channels, H, W)
 
         return x
 
@@ -265,25 +292,23 @@ class SiT(nn.Module):
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################
-# https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
+# https://github.com/SwayStar123/microdiffusion/blob/main/transformer/embed.py#L15
 
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+def get_2d_sincos_pos_embed(embed_dim, h, w):
     """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    :param embed_dim: dimension of the embedding
+    :param h: height of the grid
+    :param w: width of the grid
+    :return: [h*w, embed_dim] or [1+h*w, embed_dim] (w/ or w/o cls_token)
     """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
+    grid_h = torch.arange(h, dtype=torch.float32)
+    grid_w = torch.arange(w, dtype=torch.float32)
+    grid = torch.meshgrid(grid_h, grid_w, indexing='ij')
+    grid = torch.stack(grid, dim=0)
 
-    grid = grid.reshape([2, 1, grid_size, grid_size])
+    grid = grid.reshape([2, 1, h, w])
     pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
     return pos_embed
-
 
 def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     assert embed_dim % 2 == 0
@@ -292,9 +317,8 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
     emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
     emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
 
-    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    emb = torch.cat([emb_h, emb_w], dim=1) # (H*W, D)
     return emb
-
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     """
@@ -303,35 +327,34 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     out: (M, D)
     """
     assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega = torch.arange(embed_dim // 2, dtype=torch.float32)
     omega /= embed_dim / 2.
     omega = 1. / 10000**omega  # (D/2,)
 
     pos = pos.reshape(-1)  # (M,)
-    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+    out = torch.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
 
-    emb_sin = np.sin(out) # (M, D/2)
-    emb_cos = np.cos(out) # (M, D/2)
+    emb_sin = torch.sin(out) # (M, D/2)
+    emb_cos = torch.cos(out) # (M, D/2)
 
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    emb = torch.cat([emb_sin, emb_cos], dim=1)  # (M, D)
     return emb
-
 
 #################################################################################
 #                                   SiT Configs                                  #
 #################################################################################
 
 def SiT_XL_2(**kwargs):
-    return SiT(depth=28, hidden_size=1152, decoder_hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+    return SiT(depth=28, hidden_size=1152, decoder_hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
 
 def SiT_L_2(**kwargs):
-    return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+    return SiT(depth=24, hidden_size=1024, decoder_hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
 
 def SiT_B_2(**kwargs):
-    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=1, num_heads=12, **kwargs)
 
 def SiT_B_4(**kwargs):
-    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+    return SiT(depth=12, hidden_size=768, decoder_hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 
 SiT_models = {

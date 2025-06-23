@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import IterableDataset
 from collections import defaultdict
 from torch.utils.data import DataLoader
-from config import DATASET_NAME, DS_DIR_BASE, MAX_CAPTION_LEN, MODELS_DIR_BASE, SIGLIP_HF_NAME
+from config import DATASET_NAME, DS_DIR_BASE
 from datasets import load_dataset
 
 
@@ -84,5 +84,5 @@ class ShapeBatchingDataset(IterableDataset):
 def get_dataset(bs, seed, device, num_workers=16, split="train"):
     ds = load_dataset(DATASET_NAME, cache_dir=f"{DS_DIR_BASE}/{DATASET_NAME}", num_proc=num_workers, split=split)
 
-    ds = ShapeBatchingDataset(ds, bs, None, None, device, num_workers, shuffle=True, seed=seed)
+    ds = ShapeBatchingDataset(ds, bs, device, num_workers, shuffle=True, seed=seed)
     return ds

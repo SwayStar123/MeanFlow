@@ -19,8 +19,6 @@ class SILoss:
             cfg_kappa=0.0,                # CFG kappa param for mixing class-cond and uncond u
             cfg_min_t=0.0,                # Minium CFG trigger time 
             cfg_max_t=0.8,                # Maximum CFG trigger time
-            # Bootstrap params
-            bootstrap_ratio=0.25,        # Ratio of batch to use EMA model for GT (1/8)
             ):
         self.weighting = weighting
         self.path_type = path_type
@@ -39,9 +37,7 @@ class SILoss:
         self.cfg_kappa = cfg_kappa
         self.cfg_min_t = cfg_min_t
         self.cfg_max_t = cfg_max_t
-        
-        # Bootstrap config
-        self.bootstrap_ratio = bootstrap_ratio
+
 
     def interpolant(self, t):
         """Define interpolation function"""
@@ -85,9 +81,9 @@ class SILoss:
         
         return r, t
     
-    def __call__(self, model, ema_model, images, model_kwargs=None):
+    def __call__(self, model, images, model_kwargs=None):
         """
-        Compute MeanFlow loss function with bootstrap mechanism
+        Compute MeanFlow loss function
         """
         if model_kwargs == None:
             model_kwargs = {}
@@ -102,7 +98,10 @@ class SILoss:
         if model_kwargs.get('y') is not None and self.label_dropout_prob > 0:
             y = model_kwargs['y'].clone()  
             batch_size = y.shape[0]
-            num_classes = ema_model.num_classes
+            if hasattr(model, 'module'):  # DDP
+                num_classes = model.module.num_classes
+            else:
+                num_classes = model.num_classes
             dropout_mask = torch.rand(batch_size, device=y.device) < self.label_dropout_prob
             
             y[dropout_mask] = num_classes
@@ -121,245 +120,172 @@ class SILoss:
         # Calculate instantaneous velocity v_t 
         v_t = d_alpha_t * images + d_sigma_t * noises
         time_diff = (t - r).view(-1, 1, 1, 1)
-        
-        bootstrap_size = int(batch_size * self.bootstrap_ratio)
-        
+
+        # ------------------------------------------------------------------
+        # New logic: split the batch based on whether r == t to skip costly
+        # JVP computation when time_diff is zero.
+        # ------------------------------------------------------------------
+        eq_mask = (t == r)                    # Indices where time_diff == 0
+        neq_mask = ~eq_mask                   # Indices where time_diff != 0
+
+        # Allocate tensors for the full batch
         u_target = torch.zeros_like(v_t)
-        
-        u = model(z_t, r, t, **model_kwargs)
-        
-        # Process bootstrap samples (using EMA model)
-        if bootstrap_size > 0:
-            ema_indices = torch.arange(bootstrap_size, device=device)
-            
-            ema_z_t = z_t[ema_indices]
-            ema_v_t = v_t[ema_indices]
-            ema_r = r[ema_indices]
-            ema_t = t[ema_indices]
-            ema_time_diff = time_diff[ema_indices]
-            ema_unconditional_mask = unconditional_mask[ema_indices]
-            
-            ema_kwargs = {}
+        u = torch.zeros_like(v_t)
+
+        # -----------------------------
+        # 1) Process r == t  (no JVP)  
+        # -----------------------------
+        if eq_mask.any():
+            eq_idx = torch.where(eq_mask)[0]
+            z_t_eq   = z_t[eq_idx]
+            r_eq     = r[eq_idx]
+            t_eq     = t[eq_idx]
+            v_t_eq   = v_t[eq_idx]
+
+            # Slice model kwargs for this subset (tensor values only)
+            eq_kwargs = {}
             for k, v in model_kwargs.items():
-                if torch.is_tensor(v) and v.shape[0] == batch_size:
-                    ema_kwargs[k] = v[ema_indices]
+                if isinstance(v, torch.Tensor):
+                    eq_kwargs[k] = v[eq_idx]
                 else:
-                    ema_kwargs[k] = v
-            
-            def fn_ema(z, cur_r, cur_t):
-                return ema_model(z, cur_r, cur_t, **ema_kwargs)
-            
-            # Check if CFG should be applied (exclude unconditional samples)
-            ema_cfg_time_mask = (ema_t >= self.cfg_min_t) & (ema_t <= self.cfg_max_t) & (~ema_unconditional_mask)
-            
-            if model_kwargs.get('y') is not None and ema_cfg_time_mask.any():
-                # Split samples into CFG and non-CFG
-                ema_cfg_indices = torch.where(ema_cfg_time_mask)[0]
-                ema_no_cfg_indices = torch.where(~ema_cfg_time_mask)[0]
-                
-                ema_u_target = torch.zeros_like(ema_v_t)
-                
-                # Process CFG samples
-                if len(ema_cfg_indices) > 0:
-                    ema_cfg_z_t = ema_z_t[ema_cfg_indices]
-                    ema_cfg_v_t = ema_v_t[ema_cfg_indices]
-                    ema_cfg_r = ema_r[ema_cfg_indices]
-                    ema_cfg_t = ema_t[ema_cfg_indices]
-                    ema_cfg_time_diff = ema_time_diff[ema_cfg_indices]
-                    
-                    ema_cfg_kwargs = {}
-                    for k, v in ema_kwargs.items():
-                        if torch.is_tensor(v) and v.shape[0] == len(ema_indices):
-                            ema_cfg_kwargs[k] = v[ema_cfg_indices]
-                        else:
-                            ema_cfg_kwargs[k] = v
-                    
-                    # Compute v_tilde for CFG samples
-                    ema_cfg_y = ema_cfg_kwargs.get('y')
-                    num_classes = ema_model.num_classes
-                    
-                    ema_cfg_z_t_batch = torch.cat([ema_cfg_z_t, ema_cfg_z_t], dim=0)
-                    ema_cfg_t_batch = torch.cat([ema_cfg_t, ema_cfg_t], dim=0)
-                    ema_cfg_t_end_batch = torch.cat([ema_cfg_t, ema_cfg_t], dim=0)
-                    ema_cfg_y_batch = torch.cat([ema_cfg_y, torch.full_like(ema_cfg_y, num_classes)], dim=0)
-                    
-                    ema_cfg_combined_kwargs = ema_cfg_kwargs.copy()
-                    ema_cfg_combined_kwargs['y'] = ema_cfg_y_batch
-                    
-                    with torch.no_grad():
-                        ema_cfg_combined_u_at_t = ema_model(ema_cfg_z_t_batch, ema_cfg_t_batch, ema_cfg_t_end_batch, **ema_cfg_combined_kwargs)
-                        ema_cfg_u_cond_at_t, ema_cfg_u_uncond_at_t = torch.chunk(ema_cfg_combined_u_at_t, 2, dim=0)
-                        ema_cfg_v_tilde = (self.cfg_omega * ema_cfg_v_t + 
-                                self.cfg_kappa * ema_cfg_u_cond_at_t + 
-                                (1 - self.cfg_omega - self.cfg_kappa) * ema_cfg_u_uncond_at_t)
-                    
-                    # Compute JVP with CFG velocity
-                    def fn_ema_cfg(z, cur_r, cur_t):
-                        return ema_model(z, cur_r, cur_t, **ema_cfg_kwargs)
-                    
-                    primals = (ema_cfg_z_t, ema_cfg_r, ema_cfg_t)
-                    tangents = (ema_cfg_v_tilde, torch.zeros_like(ema_cfg_r), torch.ones_like(ema_cfg_t))
-                    _, ema_cfg_dudt = torch.func.jvp(fn_ema_cfg, primals, tangents)
-                    
-                    ema_cfg_u_target = ema_cfg_v_tilde - ema_cfg_time_diff * ema_cfg_dudt
-                    ema_u_target[ema_cfg_indices] = ema_cfg_u_target
-                
-                # Process non-CFG samples (including unconditional ones)
-                if len(ema_no_cfg_indices) > 0:
-                    ema_no_cfg_z_t = ema_z_t[ema_no_cfg_indices]
-                    ema_no_cfg_v_t = ema_v_t[ema_no_cfg_indices]
-                    ema_no_cfg_r = ema_r[ema_no_cfg_indices]
-                    ema_no_cfg_t = ema_t[ema_no_cfg_indices]
-                    ema_no_cfg_time_diff = ema_time_diff[ema_no_cfg_indices]
-                    
-                    ema_no_cfg_kwargs = {}
-                    for k, v in ema_kwargs.items():
-                        if torch.is_tensor(v) and v.shape[0] == len(ema_indices):
-                            ema_no_cfg_kwargs[k] = v[ema_no_cfg_indices]
-                        else:
-                            ema_no_cfg_kwargs[k] = v
-                    
-                    def fn_ema_no_cfg(z, cur_r, cur_t):
-                        return ema_model(z, cur_r, cur_t, **ema_no_cfg_kwargs)
-                    
-                    primals = (ema_no_cfg_z_t, ema_no_cfg_r, ema_no_cfg_t)
-                    tangents = (ema_no_cfg_v_t, torch.zeros_like(ema_no_cfg_r), torch.ones_like(ema_no_cfg_t))
-                    _, ema_no_cfg_dudt = torch.func.jvp(fn_ema_no_cfg, primals, tangents)
-                    
-                    ema_no_cfg_u_target = ema_no_cfg_v_t - ema_no_cfg_time_diff * ema_no_cfg_dudt
-                    ema_u_target[ema_no_cfg_indices] = ema_no_cfg_u_target
-            else:
-                # No labels or no CFG applicable samples, use standard JVP
-                primals = (ema_z_t, ema_r, ema_t)
-                tangents = (ema_v_t, torch.zeros_like(ema_r), torch.ones_like(ema_t))
-                _, ema_dudt = torch.func.jvp(fn_ema, primals, tangents)
-                
-                ema_u_target = ema_v_t - ema_time_diff * ema_dudt
-            
-            u_target[ema_indices] = ema_u_target
-        
-        # Process non-bootstrap samples (using current model)
-        if batch_size > bootstrap_size:
-            non_ema_indices = torch.arange(bootstrap_size, batch_size, device=device)
-            
-            non_ema_z_t = z_t[non_ema_indices]
-            non_ema_v_t = v_t[non_ema_indices]
-            non_ema_r = r[non_ema_indices]
-            non_ema_t = t[non_ema_indices]
-            non_ema_time_diff = time_diff[non_ema_indices]
-            non_ema_unconditional_mask = unconditional_mask[non_ema_indices]
-            
-            non_ema_kwargs = {}
+                    eq_kwargs[k] = v
+
+            # Single forward – no JVP needed
+            u_eq = model(z_t_eq, r_eq, t_eq, **eq_kwargs)
+            u_target_eq = v_t_eq  # time_diff = 0 => target is just velocity
+
+            # Store results back
+            u[eq_idx] = u_eq
+            u_target[eq_idx] = u_target_eq
+
+        # ---------------------------------
+        # 2) Process r != t  (standard JVP)
+        # ---------------------------------
+        if neq_mask.any():
+            neq_idx = torch.where(neq_mask)[0]
+
+            # Gather subset tensors
+            z_t_neq   = z_t[neq_idx]
+            r_neq     = r[neq_idx]
+            t_neq     = t[neq_idx]
+            v_t_neq   = v_t[neq_idx]
+            time_diff_neq = time_diff[neq_idx]
+            unconditional_mask_neq = unconditional_mask[neq_idx]
+
+            # Slice model kwargs for this subset (tensor values only)
+            neq_kwargs = {}
             for k, v in model_kwargs.items():
-                if torch.is_tensor(v) and v.shape[0] == batch_size:
-                    non_ema_kwargs[k] = v[non_ema_indices]
+                if isinstance(v, torch.Tensor):
+                    neq_kwargs[k] = v[neq_idx]
                 else:
-                    non_ema_kwargs[k] = v
-            
-            def fn_current(z, cur_r, cur_t):
-                return model(z, cur_r, cur_t, **non_ema_kwargs)
-            
-            # Check if CFG should be applied (exclude unconditional samples)
-            non_ema_cfg_time_mask = (non_ema_t >= self.cfg_min_t) & (non_ema_t <= self.cfg_max_t) & (~non_ema_unconditional_mask)
-            
-            if model_kwargs.get('y') is not None and non_ema_cfg_time_mask.any():
-                # Split samples into CFG and non-CFG
-                non_ema_cfg_indices = torch.where(non_ema_cfg_time_mask)[0]
-                non_ema_no_cfg_indices = torch.where(~non_ema_cfg_time_mask)[0]
-                
-                non_ema_u_target = torch.zeros_like(non_ema_v_t)
-                
-                # Process CFG samples
-                if len(non_ema_cfg_indices) > 0:
-                    non_ema_cfg_z_t = non_ema_z_t[non_ema_cfg_indices]
-                    non_ema_cfg_v_t = non_ema_v_t[non_ema_cfg_indices]
-                    non_ema_cfg_r = non_ema_r[non_ema_cfg_indices]
-                    non_ema_cfg_t = non_ema_t[non_ema_cfg_indices]
-                    non_ema_cfg_time_diff = non_ema_time_diff[non_ema_cfg_indices]
-                    
-                    non_ema_cfg_kwargs = {}
-                    for k, v in non_ema_kwargs.items():
-                        if torch.is_tensor(v) and v.shape[0] == len(non_ema_indices):
-                            non_ema_cfg_kwargs[k] = v[non_ema_cfg_indices]
-                        else:
-                            non_ema_cfg_kwargs[k] = v
-                    
-                    # Compute v_tilde for CFG samples
-                    non_ema_cfg_y = non_ema_cfg_kwargs.get('y')
-                    num_classes = ema_model.num_classes
-                    
-                    non_ema_cfg_z_t_batch = torch.cat([non_ema_cfg_z_t, non_ema_cfg_z_t], dim=0)
-                    non_ema_cfg_t_batch = torch.cat([non_ema_cfg_t, non_ema_cfg_t], dim=0)
-                    non_ema_cfg_t_end_batch = torch.cat([non_ema_cfg_t, non_ema_cfg_t], dim=0)
-                    non_ema_cfg_y_batch = torch.cat([non_ema_cfg_y, torch.full_like(non_ema_cfg_y, num_classes)], dim=0)
-                    
-                    non_ema_cfg_combined_kwargs = non_ema_cfg_kwargs.copy()
-                    non_ema_cfg_combined_kwargs['y'] = non_ema_cfg_y_batch
-                    
+                    neq_kwargs[k] = v
+
+            # Helper for model call with current kwargs
+            def fn_current_neq(z, cur_r, cur_t):
+                return model(z, cur_r, cur_t, **neq_kwargs)
+
+            # Determine which of these samples need CFG processing
+            cfg_time_mask_neq = (t_neq >= self.cfg_min_t) & (t_neq <= self.cfg_max_t) & (~unconditional_mask_neq)
+
+            if neq_kwargs.get('y') is not None and cfg_time_mask_neq.any():
+                # -----------------------------
+                # Split further into CFG / no-CFG
+                # -----------------------------
+                cfg_idx_local = torch.where(cfg_time_mask_neq)[0]
+                no_cfg_idx_local = torch.where(~cfg_time_mask_neq)[0]
+
+                # --- CFG branch (with improved guidance) ---
+                if len(cfg_idx_local) > 0:
+                    cfg_select = cfg_idx_local
+                    cfg_z_t = z_t_neq[cfg_select]
+                    cfg_v_t = v_t_neq[cfg_select]
+                    cfg_r   = r_neq[cfg_select]
+                    cfg_t   = t_neq[cfg_select]
+                    cfg_time_diff = time_diff_neq[cfg_select]
+
+                    cfg_kwargs = {k: (v[cfg_select] if isinstance(v, torch.Tensor) else v) for k, v in neq_kwargs.items()}
+
+                    # Build conditional & unconditional batches to compute v_tilde
+                    cfg_y = cfg_kwargs.get('y')
+                    if hasattr(model, 'module'):
+                        num_classes = model.module.num_classes
+                    else:
+                        num_classes = model.num_classes
+
+                    cfg_z_t_batch = torch.cat([cfg_z_t, cfg_z_t], dim=0)
+                    cfg_t_batch = torch.cat([cfg_t, cfg_t], dim=0)
+                    cfg_t_end_batch = torch.cat([cfg_t, cfg_t], dim=0)
+                    cfg_y_batch = torch.cat([cfg_y, torch.full_like(cfg_y, num_classes)], dim=0)
+
+                    cfg_combined_kwargs = cfg_kwargs.copy()
+                    cfg_combined_kwargs['y'] = cfg_y_batch
+
                     with torch.no_grad():
-                        non_ema_cfg_combined_u_at_t = model(non_ema_cfg_z_t_batch, non_ema_cfg_t_batch, non_ema_cfg_t_end_batch, **non_ema_cfg_combined_kwargs)
-                        non_ema_cfg_u_cond_at_t, non_ema_cfg_u_uncond_at_t = torch.chunk(non_ema_cfg_combined_u_at_t, 2, dim=0)
-                        non_ema_cfg_v_tilde = (self.cfg_omega * non_ema_cfg_v_t + 
-                                self.cfg_kappa * non_ema_cfg_u_cond_at_t + 
-                                (1 - self.cfg_omega - self.cfg_kappa) * non_ema_cfg_u_uncond_at_t)
-                    
-                    # Compute JVP with CFG velocity
+                        cfg_combined_u_at_t = model(cfg_z_t_batch, cfg_t_batch, cfg_t_end_batch, **cfg_combined_kwargs)
+                        cfg_u_cond_at_t, cfg_u_uncond_at_t = torch.chunk(cfg_combined_u_at_t, 2, dim=0)
+                        cfg_v_tilde = (
+                            self.cfg_omega * cfg_v_t +
+                            self.cfg_kappa * cfg_u_cond_at_t +
+                            (1 - self.cfg_omega - self.cfg_kappa) * cfg_u_uncond_at_t
+                        )
+
+                    # Now compute JVP only for these cfg samples
                     def fn_current_cfg(z, cur_r, cur_t):
-                        return model(z, cur_r, cur_t, **non_ema_cfg_kwargs)
-                    
-                    primals = (non_ema_cfg_z_t, non_ema_cfg_r, non_ema_cfg_t)
-                    tangents = (non_ema_cfg_v_tilde, torch.zeros_like(non_ema_cfg_r), torch.ones_like(non_ema_cfg_t))
-                    _, non_ema_cfg_dudt = torch.func.jvp(fn_current_cfg, primals, tangents)
-                    
-                    non_ema_cfg_u_target = non_ema_cfg_v_tilde - non_ema_cfg_time_diff * non_ema_cfg_dudt
-                    non_ema_u_target[non_ema_cfg_indices] = non_ema_cfg_u_target
-                
-                # Process non-CFG samples (including unconditional ones)
-                if len(non_ema_no_cfg_indices) > 0:
-                    non_ema_no_cfg_z_t = non_ema_z_t[non_ema_no_cfg_indices]
-                    non_ema_no_cfg_v_t = non_ema_v_t[non_ema_no_cfg_indices]
-                    non_ema_no_cfg_r = non_ema_r[non_ema_no_cfg_indices]
-                    non_ema_no_cfg_t = non_ema_t[non_ema_no_cfg_indices]
-                    non_ema_no_cfg_time_diff = non_ema_time_diff[non_ema_no_cfg_indices]
-                    
-                    non_ema_no_cfg_kwargs = {}
-                    for k, v in non_ema_kwargs.items():
-                        if torch.is_tensor(v) and v.shape[0] == len(non_ema_indices):
-                            non_ema_no_cfg_kwargs[k] = v[non_ema_no_cfg_indices]
-                        else:
-                            non_ema_no_cfg_kwargs[k] = v
-                    
+                        return model(z, cur_r, cur_t, **cfg_kwargs)
+
+                    primals = (cfg_z_t, cfg_r, cfg_t)
+                    tangents = (cfg_v_tilde, torch.zeros_like(cfg_r), torch.ones_like(cfg_t))
+                    cfg_u_theta, cfg_dudt = torch.func.jvp(fn_current_cfg, primals, tangents)
+
+                    cfg_u_target = cfg_v_tilde - cfg_time_diff * cfg_dudt
+
+                    # Write back to main tensors (map local -> global indices)
+                    global_cfg_idx = neq_idx[cfg_select]
+                    u[global_cfg_idx] = cfg_u_theta
+                    u_target[global_cfg_idx] = cfg_u_target
+
+                # --- NO-CFG branch (standard JVP) ---
+                if len(no_cfg_idx_local) > 0:
+                    no_cfg_select = no_cfg_idx_local
+                    no_cfg_z_t = z_t_neq[no_cfg_select]
+                    no_cfg_v_t = v_t_neq[no_cfg_select]
+                    no_cfg_r   = r_neq[no_cfg_select]
+                    no_cfg_t   = t_neq[no_cfg_select]
+                    no_cfg_time_diff = time_diff_neq[no_cfg_select]
+                    no_cfg_kwargs = {k: (v[no_cfg_select] if isinstance(v, torch.Tensor) else v) for k, v in neq_kwargs.items()}
+
                     def fn_current_no_cfg(z, cur_r, cur_t):
-                        return model(z, cur_r, cur_t, **non_ema_no_cfg_kwargs)
-                    
-                    primals = (non_ema_no_cfg_z_t, non_ema_no_cfg_r, non_ema_no_cfg_t)
-                    tangents = (non_ema_no_cfg_v_t, torch.zeros_like(non_ema_no_cfg_r), torch.ones_like(non_ema_no_cfg_t))
-                    _, non_ema_no_cfg_dudt = torch.func.jvp(fn_current_no_cfg, primals, tangents)
-                    
-                    non_ema_no_cfg_u_target = non_ema_no_cfg_v_t - non_ema_no_cfg_time_diff * non_ema_no_cfg_dudt
-                    non_ema_u_target[non_ema_no_cfg_indices] = non_ema_no_cfg_u_target
+                        return model(z, cur_r, cur_t, **no_cfg_kwargs)
+
+                    primals = (no_cfg_z_t, no_cfg_r, no_cfg_t)
+                    tangents = (no_cfg_v_t, torch.zeros_like(no_cfg_r), torch.ones_like(no_cfg_t))
+                    no_cfg_u_theta, no_cfg_dudt = torch.func.jvp(fn_current_no_cfg, primals, tangents)
+
+                    no_cfg_u_target = no_cfg_v_t - no_cfg_time_diff * no_cfg_dudt
+
+                    global_no_cfg_idx = neq_idx[no_cfg_select]
+                    u[global_no_cfg_idx] = no_cfg_u_theta
+                    u_target[global_no_cfg_idx] = no_cfg_u_target
             else:
-                # No labels or no CFG applicable samples, use standard JVP
-                primals = (non_ema_z_t, non_ema_r, non_ema_t)
-                tangents = (non_ema_v_t, torch.zeros_like(non_ema_r), torch.ones_like(non_ema_t))
-                _, non_ema_dudt = torch.func.jvp(fn_current, primals, tangents)
-                
-                non_ema_u_target = non_ema_v_t - non_ema_time_diff * non_ema_dudt
-            
-            u_target[non_ema_indices] = non_ema_u_target
-        
+                # No CFG in this subset – standard JVP for all samples here
+                primals = (z_t_neq, r_neq, t_neq)
+                tangents = (v_t_neq, torch.zeros_like(r_neq), torch.ones_like(t_neq))
+                u_neq, dudt_neq = torch.func.jvp(fn_current_neq, primals, tangents)
+                u_target_neq = v_t_neq - time_diff_neq * dudt_neq
+
+                u[neq_idx] = u_neq
+                u_target[neq_idx] = u_target_neq
+
         # Detach the target to prevent gradient flow
         u_target = u_target.detach()
-        
+
         error = u - u_target
-        
+
         # Apply adaptive weighting based on configuration
+        error_norm = torch.norm(error.reshape(error.shape[0], -1), dim=1)
+        loss = error_norm ** 2
+
         if self.weighting == "adaptive":
-            error_norm = torch.norm(error.reshape(error.shape[0], -1), dim=1)
-            weights = 1.0 / (error_norm.detach() ** 2 + 1e-3).pow(self.adaptive_p)
-            loss = weights * error_norm ** 2
-        else:
-            error_norm = torch.norm(error.reshape(error.shape[0], -1), dim=1)
-            loss = error_norm ** 2
-        
+            loss = torch.log(loss + 1e-8)
+
         return loss

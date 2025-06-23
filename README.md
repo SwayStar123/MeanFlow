@@ -53,9 +53,10 @@ Note: In the example above, we assume ImageNet has already been converted to LMD
 
 We provide training commands for different model sizes (B, L, XL) with optimized hyperparameters based on the original paper:
 
+set cfg-omega = 1 for no cfg
 ```bash
 
-accelerate launch --multi_gpu \
+sudo accelerate launch --multi_gpu \
     train.py \
     --exp-name "meanflow_b_4" \
     --output-dir "work_dir" \
@@ -73,13 +74,13 @@ accelerate launch --multi_gpu \
     --time-sigma 1.0 \
     --ratio-r-not-equal-t 0.25 \
     --adaptive-p 1.0 \
-    --cfg-omega 3.0 \ #1.0 for no cfg
+    --cfg-omega 3.0 \
     --cfg-kappa 0.\
     --cfg-min-t 0.0\
     --cfg-max-t 1.0\
     --bootstrap-ratio 0.
 
-accelerate launch --multi_gpu \
+sudo accelerate launch --multi_gpu \
     train.py \
     --exp-name "meanflow_b_2" \
     --output-dir "exp" \
@@ -103,14 +104,14 @@ accelerate launch --multi_gpu \
     --cfg-max-t 1.0\
     --bootstrap-ratio 0.
 
-accelerate launch --multi_gpu \
+sudo accelerate launch --multi_gpu \
     train.py \
     --exp-name "meanflow_l_2" \
     --output-dir "exp" \
     --data-dir "/data/train_vae_latents_lmdb" \
-    --model "SiT-L/2" \
+    --model "SiT-XL/2" \
     --resolution 256 \
-    --batch-size 256 \
+    --batch-size 128 \
     --allow-tf32 \
     --mixed-precision "bf16" \
     --epochs 240\
