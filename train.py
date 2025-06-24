@@ -240,8 +240,8 @@ def main(args):
         set_seed(args.seed + accelerator.process_index)
     
     # Create model:
-    assert args.resolution % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.resolution // 8
+    assert args.resolution % 16 == 0, "Image size must be divisible by 16 (for the VAE encoder)."
+    latent_size = args.resolution // 16
     
     # Define block_kwargs from args
     block_kwargs = {
@@ -300,7 +300,7 @@ def main(args):
     )    
     
     # Setup data:
-    train_data = get_dataset(args.batch_size, args.seed, device, args.num_workers, split="train")
+    train_data = get_dataset(args.batch_size // accelerator.num_processes, args.seed, device, args.num_workers, split="train")
     # Note: ShapeBatchingDataset is already an IterableDataset with internal DataLoader
     if accelerator.is_main_process:
         logger.info(f"Training on dataset: {args.data_dir}")
@@ -317,6 +317,7 @@ def main(args):
         ckpt = torch.load(
             f'{os.path.join(args.output_dir, args.exp_name)}/checkpoints/{ckpt_name}',
             map_location='cpu',
+            weights_only=False,
             )
         model.load_state_dict(ckpt['model'])
         ema.load_state_dict(ckpt['ema'])
@@ -326,7 +327,7 @@ def main(args):
     # Create validation dataset for FID calculation if needed (on all processes)
     val_data = None
     if args.enable_fid:
-        val_data = get_dataset(args.batch_size, args.seed + accelerator.process_index, device, args.num_workers, split="validation")
+        val_data = get_dataset(args.batch_size // accelerator.num_processes, args.seed + accelerator.process_index, device, args.num_workers, split="validation")
         # ShapeBatchingDataset doesn't need to be prepared since it's already an IterableDataset
 
     model, optimizer, train_data, val_data = accelerator.prepare(
@@ -348,10 +349,24 @@ def main(args):
         # Create fixed noise for consistent sampling
         fixed_noise = torch.randn(16, 32, latent_size, latent_size, device=device)
         
-        # Define example captions/labels for sampling
-        ex_labels = torch.tensor([
-            933, 954, 849, 980, 971, 938, 953, 672, 
-            235, 817, 283, 603, 834, 497, 851, 4
+    # Define example captions/labels for sampling
+    ex_labels = torch.tensor([
+        933,  # cheeseburger
+        954,  # banana
+        849,  # teapot
+        980,  # volcano
+        971,  # bubble
+        938,  # cauliflower
+        953,  # pineapple, ananas
+        672,  # mountain tent
+        235,  # German shepherd, German shepherd dog, German police dog, alsatian
+        817,  # sports car, sport car
+        283,  # Persian cat
+        603,  # horse cart, horse-cart
+        834,  # suit, suit of clothes
+        497,  # church, church building
+        851,  # television, television system
+        4,    # hammerhead, hammerhead shark
         ], device=device)  # Example ImageNet class labels
         
     progress_bar = tqdm(
@@ -428,12 +443,12 @@ def main(args):
                 wandb.log({"loss": logs["loss"], "grad_norm": logs["grad_norm"]}, step=global_step)
             
             # Log to file periodically
-            if accelerator.is_main_process and global_step % 100 == 0:
-                logger.info(f"Step {global_step}: loss = {logs['loss']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
+            # if accelerator.is_main_process and global_step % 100 == 0:
+            #     logger.info(f"Step {global_step}: loss = {logs['loss']:.4f}, grad_norm = {logs['grad_norm']:.4f}")
             
             # Sample images every 200 steps
             if accelerator.is_main_process and global_step % 200 == 0 and global_step > 0:
-                logger.info(f"Sampling images at step {global_step}")
+                # logger.info(f"Sampling images at step {global_step}")
                 with torch.no_grad():
                     model.eval()
                     vae = vae.to(device)
@@ -444,9 +459,10 @@ def main(args):
                     # Save sampled images
                     sample_path = f"{save_dir}/sampled_images_step_{global_step:07d}.png"
                     torchvision.utils.save_image(grid, sample_path)
-                    
-                    # Log to wandb
-                    wandb.log({"sampled_images": wandb.Image(sample_path)}, step=global_step)
+                     
+                    # Log to wandb more rarely, due to storage limits
+                    if global_step % 10000 == 0:
+                        wandb.log({"sampled_images": wandb.Image(sample_path)}, step=global_step)
                     
                     # Move VAE back to CPU to save memory
                     vae = vae.to("cpu")
